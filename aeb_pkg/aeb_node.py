@@ -7,6 +7,33 @@ from inertial_msgs.msg import Pose
 from vehiclecontrol.msg import Control
 import time
 
+class PIDController:
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.integral = 0.0
+        self.previous_error = 0.0
+        self.last_time = time.time()
+
+    def compute(self, setpoint, measured_value):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        
+        if dt <= 0:
+            return 0.0
+            
+        error = setpoint - measured_value
+        self.integral += error * dt
+        derivative = (error - self.previous_error) / dt if dt > 0 else 0.0
+        
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        
+        self.previous_error = error
+        self.last_time = current_time
+        
+        return output
+
 class AEBNode(Node):
     def __init__(self):
         super().__init__('aeb_node')
@@ -22,45 +49,37 @@ class AEBNode(Node):
         
         self.vehicle_speed = 0.0
         self.vehicle_position_x = 0.0
-        self.last_position_x = 0.0
         
-        self.target_speed = 30.0 * (1000.0 / 3600.0)
-        self.acceleration = 2.0
+        self.target_speed = 30.0 * (1000.0 / 3600.0)  # 8.33 m/s
+        self.acceleration = 0.8  # Reduced to 0.8 m/s^2
         self.distance_threshold = 100.0
         
-        self.safe_distance_min = 3.0
+        self.safe_distance_min = 5.0
         self.reaction_time = 0.5
-        self.ttc_threshold = 2.0
-        self.brake_deceleration = -5.0
+        self.ttc_threshold = 1.5
+        self.brake_deceleration = -0.5  # Reduced to -0.5 m/s^2 for smoother braking
         self.obstacle_detected = False
         self.obstacle_distance = float('inf')
         self.obstacle_velocity = 0.0
         
+        self.pid_controller = PIDController(Kp=0.8, Ki=0.2, Kd=0.1)  # Adjusted gains
+        
         self.simulation_ready = False
-        self.position_update_count = 0  # Counter for consistent updates
-        self.initial_delay = 15.0  # Increased to 15 seconds
+        self.initial_delay = 15.0
         self.start_time = time.time()
 
         self.get_logger().info(f'Waiting {self.initial_delay} seconds for simulation to initialize...')
         while time.time() - self.start_time < self.initial_delay:
             time.sleep(0.1)
-
-        self.get_logger().info('Initial delay complete, waiting for consistent /InertialData updates...')
+        self.simulation_ready = True
+        self.get_logger().info('Initial delay complete, starting control commands.')
 
     def vehicle_state_callback(self, msg):
         self.vehicle_speed = msg.velocity.x
         self.vehicle_position_x = msg.position.x
         
-        if not self.simulation_ready:
-            if self.vehicle_position_x > self.last_position_x and self.vehicle_position_x > 0.0:
-                self.position_update_count += 1
-                if self.position_update_count >= 10:  # Wait for 10 consistent updates
-                    self.simulation_ready = True
-                    self.get_logger().info('Simulation is ready (consistent position updates), starting control commands.')
-            self.last_position_x = self.vehicle_position_x
-            return
-        
-        self.publish_control()
+        if self.simulation_ready:
+            self.publish_control()
 
     def obstacle_callback(self, msg):
         self.obstacle_detected = True
@@ -95,7 +114,7 @@ class AEBNode(Node):
             control_msg.brake = 0.0
         else:
             control_msg.throttle = 0.0
-            control_msg.brake = min(-acceleration / 5.0, 1.0)
+            control_msg.brake = min(-acceleration / 0.5, 1.0)  # Adjusted to match new brake_deceleration
         
         control_msg.steering = 0.0
         control_msg.latswitch = 0
@@ -106,15 +125,12 @@ class AEBNode(Node):
 
     def calculate_longitudinal_control(self):
         if self.vehicle_position_x < self.distance_threshold and self.vehicle_speed < self.target_speed:
-            acceleration = self.acceleration
+            speed_diff = self.target_speed - self.vehicle_speed
+            acceleration = min(self.acceleration * (speed_diff / self.target_speed), self.acceleration)
             self.get_logger().info(f'Accelerating: speed={self.vehicle_speed:.2f} m/s, position={self.vehicle_position_x:.2f} m')
         else:
-            if self.vehicle_speed > self.target_speed + 0.1:
-                acceleration = -0.5
-            elif self.vehicle_speed < self.target_speed - 0.1:
-                acceleration = 0.5
-            else:
-                acceleration = 0.0
+            acceleration = self.pid_controller.compute(self.target_speed, self.vehicle_speed)
+            acceleration = max(min(acceleration, 1.0), -1.0)  # Allow both throttle and brake
             self.get_logger().info(f'Maintaining speed: speed={self.vehicle_speed:.2f} m/s')
         return acceleration
 
